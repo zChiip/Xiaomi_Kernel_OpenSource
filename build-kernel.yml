@@ -1,1 +1,144 @@
+name: Build Optimized Kernel - Redmi Note 12 4G (topaz/tapas)
 
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_NAME:
+        description: 'Nome personalizado do Kernel'
+        required: true
+        default: 'Topaz-HyperOS2'
+      KERNEL_VERSION:
+        description: 'Versão do Kernel'
+        required: true
+        default: 'v2.0'
+      ROOT_SOL:
+        description: 'Selecione a Solução de ROOT / KernelSU'
+        required: true
+        default: 'KernelSU-Next'
+        type: choice
+        options:
+          - 'KernelSU'
+          - 'KernelSU-Next'
+          - 'SukiSU'
+          - 'None'
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git ccache automake flex lzop bison gperf build-essential \
+            zip curl zlib1g-dev g++-multilib libxml2-utils bzip2 \
+            libbz2-dev libbz2-1.0 libghc-bzlib-dev squashfs-tools \
+            pngcrush schedtool dpkg-dev liblz4-tool make optipng \
+            maven libssl-dev pwgen libswitch-perl policycoreutils \
+            minicom libxml-saxon-perl libproxy-tools bc libelf-dev \
+            lld llvm
+
+      - name: Setup Android 15 Toolchain (AOSP Clang r510900)
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/clang
+          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r510900.tar.gz
+          tar -xf clang-r510900.tar.gz -C $GITHUB_WORKSPACE/clang
+          rm clang-r510900.tar.gz
+
+      - name: Integrate ROOT Solution (${{ github.event.inputs.ROOT_SOL }})
+        run: |
+          CHOICE="${{ github.event.inputs.ROOT_SOL }}"
+          if [ "$CHOICE" = "KernelSU" ]; then
+            echo "Integrando KernelSU Oficial..."
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          elif [ "$CHOICE" = "KernelSU-Next" ]; then
+            echo "Integrando KernelSU Next..."
+            curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+          elif [ "$CHOICE" = "SukiSU" ]; then
+            echo "Integrando SukiSU..."
+            curl -LSs "https://raw.githubusercontent.com/Master-Suki/SukiSU/main/kernel/setup.sh" | bash -
+          else
+            echo "Nenhuma solução de ROOT selecionada."
+          fi
+
+      - name: Set Custom Kernel Name & Version
+        run: |
+          NEW_NAME="-${{ github.event.inputs.KERNEL_NAME }}-${{ github.event.inputs.KERNEL_VERSION }}-${{ github.event.inputs.ROOT_SOL }}"
+          sed -i "s/^EXTRAVERSION =.*/EXTRAVERSION = ${NEW_NAME}/" Makefile
+
+      - name: Configure Kernel (Merge Configs + Optimizations)
+        run: |
+          mkdir -p out
+          export ARCH=arm64
+
+          # 1. Base GKI
+          make O=out ARCH=arm64 gki_defconfig
+
+          # 2. Localiza e junta fragmentos do topaz/bengal
+          BENGAL_CFG=$(find arch/arm64/configs/ -name "bengal_GKI.config" | head -n 1)
+          TOPAZ_CFG=$(find arch/arm64/configs/ -name "topaz_GKI.config" | head -n 1)
+
+          ./scripts/kconfig/merge_config.sh -m -O out out/.config $BENGAL_CFG $TOPAZ_CFG
+
+          # 3. Ativa Suporte a Kprobes para Android 15 / KernelSU
+          echo "CONFIG_KPROBES=y" >> out/.config
+          echo "CONFIG_HAVE_KPROBES=y" >> out/.config
+          echo "CONFIG_KPROBE_EVENTS=y" >> out/.config
+
+          # 4. Injeta flags de otimização de performance
+          echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> out/.config
+
+          make O=out ARCH=arm64 olddefconfig
+
+      - name: Compile Kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CC=clang
+          export LD=ld.lld
+          export AR=llvm-ar
+          export NM=llvm-nm
+          export OBJCOPY=llvm-objcopy
+          export OBJDUMP=llvm-objdump
+          export STRIP=llvm-strip
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+          # Flags de otimização focadas nos núcleos Cortex-A73/A53 do Snapdragon 685
+          export KCFLAGS="-O3 -march=armv8.2-a+crypto+dotprod -mtune=cortex-a73 -pipe"
+
+          make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3 --depth=1 AnyKernel3
+          rm -rf AnyKernel3/.git
+
+          sed -i 's/device.name1=.*/device.name1=topaz/' AnyKernel3/anykernel.sh
+          sed -i 's/device.name2=.*/device.name2=tapas/' AnyKernel3/anykernel.sh
+          sed -i 's/is_slot_device=.*/is_slot_device=0/' AnyKernel3/anykernel.sh
+
+          if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
+            cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+          elif [ -f out/arch/arm64/boot/Image.gz ]; then
+            cp out/arch/arm64/boot/Image.gz AnyKernel3/
+          elif [ -f out/arch/arm64/boot/Image ]; then
+            cp out/arch/arm64/boot/Image AnyKernel3/
+          else
+            echo "Erro: Imagem do Kernel não gerada!" && exit 1
+          fi
+
+          cd AnyKernel3
+          ZIP_NAME="${{ github.event.inputs.KERNEL_NAME }}-${{ github.event.inputs.KERNEL_VERSION }}-${{ github.event.inputs.ROOT_SOL }}-topaz.zip"
+          zip -r9 "../$ZIP_NAME" *
+          echo "ZIP_PATH=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Upload Kernel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.KERNEL_NAME }}-${{ github.event.inputs.ROOT_SOL }}
+          path: ${{ env.ZIP_PATH }}
