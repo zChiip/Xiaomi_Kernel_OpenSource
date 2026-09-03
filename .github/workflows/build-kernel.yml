@@ -26,8 +26,10 @@ jobs:
   build-kernel:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Kernel Source
+      - name: Checkout Kernel Source (Branch topaz-t-oss)
         uses: actions/checkout@v4
+        with:
+          ref: topaz-t-oss
 
       - name: Install Build Dependencies
         run: |
